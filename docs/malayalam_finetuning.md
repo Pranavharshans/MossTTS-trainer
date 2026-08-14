@@ -72,7 +72,7 @@ The submission script creates an `afterok` dependency chain:
    resized model.
 2. `prepare`: encodes target audio with the MOSS codec and performs exact
    packed-length filtering.
-3. `train`: full-model BF16 SFT for three epochs on one A100, with validation
+3. `train`: full-model BF16 SFT for three epochs on one A40, with validation
    loss and permanent epoch checkpoints.
 4. `eval`: generates the seven-prompt matched audio suite for the initialized
    extended model and every epoch checkpoint.

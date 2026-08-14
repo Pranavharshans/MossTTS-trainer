@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #SBATCH --job-name=moss-ml-train
-#SBATCH --partition=a100
-#SBATCH --gres=gpu:a100:1
+#SBATCH --partition=a40
+#SBATCH --gres=gpu:a40:1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --time=24:00:00
