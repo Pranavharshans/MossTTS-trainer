@@ -78,7 +78,7 @@ requeue_before_timeout() {
 }
 trap requeue_before_timeout USR1
 
-accelerate launch --num_processes 1 finetuning/sft.py \
+python -u finetuning/sft.py \
     --model-path "${MOSS_EXTENDED_MODEL}" \
     --codec-path "${MOSS_CODEC_MODEL}" \
     --train-jsonl "${TRAIN_SPEC}" \
