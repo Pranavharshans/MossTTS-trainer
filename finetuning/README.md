@@ -1,5 +1,10 @@
 # MOSS-TTS-Nano Finetuning Guide
 
+For the reproducible Malayalam FAU Alex workflow with an ID-preserving
+tokenizer extension, see
+[`docs/malayalam_finetuning.md`](../docs/malayalam_finetuning.md) and
+[`scripts/slurm/submit_malayalam_alex.sh`](../scripts/slurm/submit_malayalam_alex.sh).
+
 This directory provides a complete finetuning workflow for `MOSS-TTS-Nano`:
 
 - `prepare_data.py`: precomputes `audio_codes` for target audio and, when needed, `ref_audio_codes`
@@ -177,7 +182,8 @@ Keep the rest of the training command unchanged.
 
 ### 4.4 Important Arguments
 
-- `--max-length`: fixed full sequence length. Samples are truncated to this length and then padded.
+- `--max-length`: fixed full sequence length. Overlength samples raise an error;
+  use `prepare_sharded_dataset.py` to reject them explicitly before training.
 - `--channelwise-loss-weight`: supports two formats
   - `text_head,vq0,...,vqN`
   - `text_weight,total_audio_weight`
@@ -196,6 +202,7 @@ Each checkpoint directory can be loaded directly by the inference code in this r
 - tokenizer files
 - the Nano model Python source files needed for loading
 - `finetune_config.json`
+- `trainer_state.pt` and `trainer_state.json` for epoch-boundary resume
 
 ## 5. One-Click Script
 

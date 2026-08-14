@@ -59,6 +59,12 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="A single JSONL, directory, glob, or comma-separated list of JSONLs produced by prepare_data.py.",
     )
+    parser.add_argument(
+        "--eval-jsonl",
+        type=str,
+        default=None,
+        help="Optional prepared validation JSONL spec. Loss is reported after each epoch.",
+    )
     parser.add_argument("--output-dir", type=str, default="output/moss_tts_nano_sft")
     parser.add_argument("--max-length", type=int, default=1024, help="Fixed full sequence length before shift.")
     parser.add_argument("--per-device-batch-size", type=int, default=1)
@@ -89,6 +95,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        default="none",
+        help="Use `auto`, `none`, or a checkpoint directory. Resume occurs at an epoch boundary.",
+    )
     return parser.parse_args()
 
 
@@ -328,34 +339,150 @@ def save_checkpoint(
     train_args: Dict[str, Any],
     global_step: int,
     epoch: int,
+    optimizer,
+    lr_scheduler,
 ) -> None:
     accelerator.wait_for_everyone()
-    if not accelerator.is_main_process:
-        return
+    if accelerator.is_main_process:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        unwrapped_model = unwrap_training_model(model)
+        codec_path_obj = Path(codec_path).expanduser()
+        if codec_path_obj.exists():
+            resolved_codec_path = str(codec_path_obj.resolve())
+        else:
+            resolved_codec_path = codec_path
+        unwrapped_model.config.audio_tokenizer_pretrained_name_or_path = resolved_codec_path
+        unwrapped_model.config.save_pretrained(output_dir)
+        state_dict = {
+            key: value.detach().cpu()
+            for key, value in unwrapped_model.state_dict().items()
+        }
+        torch.save(state_dict, output_dir / "pytorch_model.bin")
+        tokenizer.save_pretrained(output_dir)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    unwrapped_model = unwrap_training_model(model)
-    unwrapped_model.config.audio_tokenizer_pretrained_name_or_path = str(Path(codec_path).expanduser().resolve())
-    unwrapped_model.config.save_pretrained(output_dir)
-    state_dict = {
-        key: value.detach().cpu()
-        for key, value in unwrapped_model.state_dict().items()
+        for filename in MODEL_SUPPORT_FILES:
+            src = resolve_asset(model_path, filename)
+            if src is not None and src.exists():
+                shutil.copy2(src, output_dir / filename)
+
+        metadata = dict(train_args)
+        metadata["saved_global_step"] = int(global_step)
+        metadata["saved_epoch"] = int(epoch)
+        metadata["saved_at"] = format_timestamp()
+        metadata["checkpoint_dir"] = str(output_dir)
+        with open(output_dir / "finetune_config.json", "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2, ensure_ascii=False)
+        trainer_state = {
+            "global_step": int(global_step),
+            "completed_epochs": int(epoch),
+            "optimizer": optimizer.state_dict(),
+            "lr_scheduler": lr_scheduler.state_dict(),
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_state_all": torch.cuda.get_rng_state_all(),
+        }
+        torch.save(trainer_state, output_dir / "trainer_state.pt")
+        with open(output_dir / "trainer_state.json", "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "global_step": int(global_step),
+                    "completed_epochs": int(epoch),
+                    "saved_at": metadata["saved_at"],
+                },
+                handle,
+                indent=2,
+            )
+    accelerator.wait_for_everyone()
+
+
+def read_checkpoint_progress(path: Path) -> Optional[Dict[str, int]]:
+    state_path = path / "trainer_state.json"
+    weights_path = path / "pytorch_model.bin"
+    binary_state_path = path / "trainer_state.pt"
+    if not (state_path.is_file() and weights_path.is_file() and binary_state_path.is_file()):
+        return None
+    try:
+        value = json.loads(state_path.read_text(encoding="utf-8"))
+        return {
+            "global_step": int(value["global_step"]),
+            "completed_epochs": int(value["completed_epochs"]),
+        }
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def resolve_resume_checkpoint(spec: str, output_root: Path) -> Optional[Path]:
+    normalized = str(spec).strip()
+    if normalized.lower() in {"", "none", "false", "0"}:
+        return None
+    if normalized.lower() != "auto":
+        path = Path(normalized).expanduser().resolve()
+        if read_checkpoint_progress(path) is None:
+            raise ValueError(f"resume checkpoint is incomplete: {path}")
+        return path
+
+    candidates: list[tuple[int, int, Path]] = []
+    for path in output_root.glob("checkpoint-epoch-*"):
+        if not path.is_dir():
+            continue
+        progress = read_checkpoint_progress(path)
+        if progress is not None:
+            candidates.append(
+                (progress["completed_epochs"], progress["global_step"], path.resolve())
+            )
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: (item[0], item[1], item[2].name))[2]
+
+
+def restore_training_state(
+    checkpoint: Path,
+    *,
+    optimizer,
+    lr_scheduler,
+) -> Dict[str, int]:
+    state = torch.load(checkpoint / "trainer_state.pt", map_location="cpu", weights_only=False)
+    optimizer.load_state_dict(state["optimizer"])
+    lr_scheduler.load_state_dict(state["lr_scheduler"])
+    torch.set_rng_state(state["torch_rng_state"])
+    if torch.cuda.is_available() and state.get("cuda_rng_state_all"):
+        torch.cuda.set_rng_state_all(state["cuda_rng_state_all"])
+    return {
+        "global_step": int(state["global_step"]),
+        "completed_epochs": int(state["completed_epochs"]),
     }
-    torch.save(state_dict, output_dir / "pytorch_model.bin")
-    tokenizer.save_pretrained(output_dir)
 
-    for filename in MODEL_SUPPORT_FILES:
-        src = resolve_asset(model_path, filename)
-        if src is not None and src.exists():
-            shutil.copy2(src, output_dir / filename)
 
-    metadata = dict(train_args)
-    metadata["saved_global_step"] = int(global_step)
-    metadata["saved_epoch"] = int(epoch)
-    metadata["saved_at"] = format_timestamp()
-    metadata["checkpoint_dir"] = str(output_dir)
-    with open(output_dir / "finetune_config.json", "w", encoding="utf-8") as handle:
-        json.dump(metadata, handle, indent=2, ensure_ascii=False)
+@torch.no_grad()
+def evaluate_loss(
+    *,
+    accelerator: Accelerator,
+    model,
+    dataloader: DataLoader,
+    channelwise_loss_weight: List[float],
+) -> float:
+    model.eval()
+    total = torch.zeros(2, dtype=torch.float64, device=accelerator.device)
+    for batch in dataloader:
+        loss = compute_supervised_loss(
+            model,
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            labels=batch["labels"],
+            channelwise_loss_weight=channelwise_loss_weight,
+        )
+        batch_size = int(batch["input_ids"].shape[0])
+        total[0] += loss.detach().double() * batch_size
+        total[1] += batch_size
+    total = accelerator.reduce(total, reduction="sum")
+    if total[1].item() <= 0:
+        raise RuntimeError("validation dataloader is empty")
+    return float((total[0] / total[1]).item())
+
+
+def append_metrics(path: Path, record: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def main() -> None:
@@ -376,19 +503,32 @@ def main() -> None:
             f"MOSS-TTS-Nano finetuning requires CUDA, but Accelerate resolved device={accelerator.device}."
         )
 
+    output_root = Path(args.output_dir).expanduser().resolve()
+    resume_checkpoint = resolve_resume_checkpoint(args.resume_from_checkpoint, output_root)
+    load_model_path = str(resume_checkpoint) if resume_checkpoint is not None else args.model_path
+
     model_dtype = resolve_torch_dtype(args.mixed_precision)
     attn_implementation = resolve_attn_implementation(args.attn_implementation, model_dtype)
     records_paths, records = load_jsonl_spec(args.train_jsonl)
+    eval_paths: List[Path] = []
+    eval_records: List[Dict[str, Any]] = []
+    if args.eval_jsonl:
+        eval_paths, eval_records = load_jsonl_spec(args.eval_jsonl)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(load_model_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
 
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
+        load_model_path,
         trust_remote_code=True,
         torch_dtype=model_dtype,
     )
+    embedding_vocab_size = int(model.get_input_embeddings().num_embeddings)
+    if len(tokenizer) != embedding_vocab_size:
+        raise RuntimeError(
+            f"tokenizer vocab={len(tokenizer)} does not match model embeddings={embedding_vocab_size}"
+        )
     if hasattr(model, "_set_attention_implementation"):
         model._set_attention_implementation(attn_implementation)
 
@@ -406,6 +546,22 @@ def main() -> None:
         pin_memory=torch.cuda.is_available(),
         collate_fn=dataset.collate_fn,
     )
+    eval_dataloader = None
+    if eval_records:
+        eval_dataset = MossTTSNanoSFTDataset(
+            eval_records,
+            tokenizer=tokenizer,
+            model_config=model.config,
+            max_length=args.max_length,
+        )
+        eval_dataloader = DataLoader(
+            eval_dataset,
+            batch_size=args.per_device_batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=torch.cuda.is_available(),
+            collate_fn=eval_dataset.collate_fn,
+        )
 
     optimizer = build_optimizer(model, args)
     global_batch_size = (
@@ -426,14 +582,22 @@ def main() -> None:
         num_warmup_steps=warmup_steps,
         num_training_steps=max_train_steps,
     )
-    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        model,
-        optimizer,
-        train_dataloader,
-        lr_scheduler,
-    )
+    if eval_dataloader is None:
+        model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            model,
+            optimizer,
+            train_dataloader,
+            lr_scheduler,
+        )
+    else:
+        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
+            model,
+            optimizer,
+            train_dataloader,
+            eval_dataloader,
+            lr_scheduler,
+        )
 
-    output_root = Path(args.output_dir)
     if accelerator.is_main_process:
         output_root.mkdir(parents=True, exist_ok=True)
 
@@ -442,6 +606,7 @@ def main() -> None:
     train_args_to_save["resolved_channelwise_loss_weight"] = channelwise_loss_weight
     train_args_to_save["global_batch_size"] = global_batch_size
     train_args_to_save["records_paths"] = [str(path.resolve()) for path in records_paths]
+    train_args_to_save["eval_records_paths"] = [str(path.resolve()) for path in eval_paths]
     train_args_to_save["attn_implementation"] = attn_implementation
 
     accelerator.print(
@@ -454,15 +619,28 @@ def main() -> None:
         f"max_train_steps={max_train_steps} "
         f"warmup_steps={warmup_steps} "
         f"attn={attn_implementation} "
-        f"model_dtype={model_dtype}"
+        f"model_dtype={model_dtype} "
+        f"resume={resume_checkpoint or 'none'}"
     )
 
     global_step = 0
     completed_epochs = 0
+    if resume_checkpoint is not None:
+        restored = restore_training_state(
+            resume_checkpoint,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+        )
+        global_step = restored["global_step"]
+        completed_epochs = restored["completed_epochs"]
+        accelerator.print(
+            f"[{format_timestamp()}] [sft] resumed checkpoint={resume_checkpoint} "
+            f"completed_epochs={completed_epochs} global_step={global_step}"
+        )
     last_log_time = time.perf_counter()
-    last_logged_step = 0
+    last_logged_step = global_step
 
-    for epoch in range(args.num_epochs):
+    for epoch in range(completed_epochs, args.num_epochs):
         model.train()
         for batch in train_dataloader:
             with accelerator.accumulate(model):
@@ -500,7 +678,7 @@ def main() -> None:
                     lr_val = lr_scheduler.get_last_lr()[0]
                     accelerator.print(
                         f"[{format_timestamp()}] "
-                        f"epoch={epoch} step={global_step}/{max_train_steps} "
+                        f"epoch={epoch + 1} step={global_step}/{max_train_steps} "
                         f"loss={logged_loss:.4f} "
                         f"lr={lr_val:.2e} "
                         f"step_time={step_time:.2f}s "
@@ -512,34 +690,62 @@ def main() -> None:
                 if global_step >= max_train_steps:
                     break
 
+        validation_loss = None
+        if eval_dataloader is not None:
+            validation_loss = evaluate_loss(
+                accelerator=accelerator,
+                model=model,
+                dataloader=eval_dataloader,
+                channelwise_loss_weight=channelwise_loss_weight,
+            )
+            accelerator.print(
+                f"[{format_timestamp()}] [sft] epoch={epoch + 1} "
+                f"validation_loss={validation_loss:.6f}"
+            )
+            if accelerator.is_main_process:
+                append_metrics(
+                    output_root / "metrics.jsonl",
+                    {
+                        "timestamp": format_timestamp(),
+                        "epoch": epoch + 1,
+                        "global_step": global_step,
+                        "validation_loss": validation_loss,
+                    },
+                )
+
         if (epoch + 1) % args.save_every_epochs == 0 or global_step >= max_train_steps:
             save_checkpoint(
                 accelerator=accelerator,
                 model=model,
                 tokenizer=tokenizer,
-                model_path=args.model_path,
+                model_path=load_model_path,
                 codec_path=args.codec_path,
                 output_dir=output_root / f"checkpoint-epoch-{epoch + 1}",
                 train_args=train_args_to_save,
                 global_step=global_step,
                 epoch=epoch + 1,
+                optimizer=optimizer,
+                lr_scheduler=lr_scheduler,
             )
         completed_epochs = epoch + 1
 
         if global_step >= max_train_steps:
             break
 
-    save_checkpoint(
-        accelerator=accelerator,
-        model=model,
-        tokenizer=tokenizer,
-        model_path=args.model_path,
-        codec_path=args.codec_path,
-        output_dir=output_root / "checkpoint-last",
-        train_args=train_args_to_save,
-        global_step=global_step,
-        epoch=completed_epochs,
-    )
+    if completed_epochs > 0:
+        save_checkpoint(
+            accelerator=accelerator,
+            model=model,
+            tokenizer=tokenizer,
+            model_path=load_model_path,
+            codec_path=args.codec_path,
+            output_dir=output_root / "checkpoint-last",
+            train_args=train_args_to_save,
+            global_step=global_step,
+            epoch=completed_epochs,
+            optimizer=optimizer,
+            lr_scheduler=lr_scheduler,
+        )
     accelerator.print(
         f"[{format_timestamp()}] [sft] finished "
         f"global_step={global_step} saved_epochs={completed_epochs} output_dir={output_root}"

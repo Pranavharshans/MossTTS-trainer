@@ -115,7 +115,11 @@ class MossTTSNanoSFTDataset(Dataset):
             )
 
         if full_sequence.shape[0] > self.max_length:
-            full_sequence = full_sequence[: self.max_length]
+            raise ValueError(
+                f"Record {index} packed length {int(full_sequence.shape[0])} exceeds "
+                f"max_length {self.max_length}. Filter it during data preparation or "
+                "increase --max-length; silent target truncation is disabled."
+            )
 
         seq_len = int(full_sequence.shape[0])
         if seq_len < 2:

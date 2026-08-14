@@ -199,3 +199,9 @@ weights/tts/*.bin
 weights/tts/tokenizer.model
 generated_audio/*
 .app_prompt_uploads/*
+
+# Malayalam finetuning data, caches, models, and checkpoints
+models/
+output/
+data/malayalam/
+*.part
