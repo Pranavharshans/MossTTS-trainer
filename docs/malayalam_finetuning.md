@@ -41,7 +41,7 @@ parameters (`2048 x 768`), but avoids invalidating the pretrained rows.
 - Evaluation reference: `eval_prompt.flac` and `eval_prompt.txt` in the same directory
 - Base model revision: `44502f80dbf9743528fa921cc544d662c685ebec`
 - Codec revision: `6aa02b01e445cc585582cf0ba480bc3ea6c8dd68`
-- Default runtime root: `/anvme/workspace/v123be62-moss-tts`
+- Default runtime root: `/anvme/workspace/v123be62-voxcpm-ml/moss-tts-runtime`
 
 The existing audio is 16 kHz mono FLAC. Preparation decodes it and feeds it to
 the model's 48 kHz codec, which performs the required resampling/channel
@@ -61,7 +61,7 @@ Explicit paths can be supplied when needed:
 ```bash
 bash scripts/slurm/submit_malayalam_alex.sh \
   /absolute/path/to/MossTTS-trainer \
-  /anvme/workspace/v123be62-moss-tts \
+  /anvme/workspace/v123be62-voxcpm-ml/moss-tts-runtime \
   /anvme/workspace/v123be62-voxcpm-ml/voxcpm-runtime/datasets/rasa-malayalam
 ```
 
@@ -79,7 +79,7 @@ The submission script creates an `afterok` dependency chain:
 
 The command prints all four job IDs and exact `squeue`, `sacct`, and `tail`
 monitoring commands. Logs are stored under
-`/anvme/workspace/v123be62-moss-tts/logs` by default.
+`/anvme/workspace/v123be62-voxcpm-ml/moss-tts-runtime/logs` by default.
 
 ## Resume behavior and outputs
 

@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 REPO_DIR=${1:-$(pwd)}
-RUNTIME_ROOT=${2:-/anvme/workspace/v123be62-moss-tts}
+RUNTIME_ROOT=${2:-/anvme/workspace/v123be62-voxcpm-ml/moss-tts-runtime}
 DATA_DIR=${3:-/anvme/workspace/v123be62-voxcpm-ml/voxcpm-runtime/datasets/rasa-malayalam}
 
 REPO_DIR=$(realpath "${REPO_DIR}")
